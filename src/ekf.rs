@@ -1,5 +1,27 @@
 use nalgebra::{Matrix2, SMatrix, Vector2};
 
+use std::f64::consts::PI;
+/// Alternative: Direct computation with modulo
+pub fn angle_difference_simple(angle1: f64, angle2: f64) -> f64 {
+    let mut diff = (angle1 - angle2) % (2.0 * PI);
+
+    // Ensure diff is in [0, 2π)
+    if diff < 0.0 {
+        diff += 2.0 * PI;
+    }
+
+    // Convert to [-π, π]
+    if diff > PI { diff - 2.0 * PI } else { diff }
+}
+
+pub fn wrap_to_pi(angle: f64) -> f64 {
+    let mut wrapped = (angle + PI) % (2.0 * PI);
+    if wrapped < 0.0 {
+        wrapped += 2.0 * PI;
+    }
+    wrapped - PI
+}
+
 /// Extended Kalman Filter for 2D state estimation
 pub struct ExtendedKalmanFilter {
     /// State vector [x, y]
@@ -30,11 +52,13 @@ impl ExtendedKalmanFilter {
     /// Update step
     pub fn update(&mut self, measurement_model: &MeasurementModel, measurement: f64) {
         // Innovation (measurement residual)
-        let predicted_measurement = measurement_model.predict_measurement(&self.state);
-        let innovation = measurement - predicted_measurement;
+        let predicted_measurement = wrap_to_pi(measurement_model.predict_measurement(&self.state));
+        let innovation = angle_difference_simple(measurement, predicted_measurement);
 
         // Measurement Jacobian
         let h = measurement_model.jacobian(&self.state);
+
+        // dbg!(&h);
 
         // Innovation covariance: S = H * P * H^T + R
         let s = h * self.covariance * h.transpose() + measurement_model.measurement_noise;
@@ -43,6 +67,16 @@ impl ExtendedKalmanFilter {
         // For 1x1 matrix, inversion is just 1/value
         let s_inv = 1.0 / s[(0, 0)];
         let kalman_gain = self.covariance * h.transpose() * s_inv;
+
+        dbg!(&kalman_gain);
+        dbg!(&innovation);
+
+        let mahalanobis = innovation * (1.0 / s[(0, 0)]) * innovation;
+
+        if mahalanobis > 1.0 {
+            println!("Manalanobis Fucked");
+            return;
+        }
 
         // State update: x = x + K * innovation
         self.state = self.state + kalman_gain * innovation;
@@ -112,7 +146,7 @@ impl MeasurementModel {
     pub fn predict_measurement(&self, state: &Vector2<f64>) -> f64 {
         let vec_i = state[0] - self.h_pos;
         let vec_j = state[1] - self.k_pos;
-        vec_j.atan2(vec_i) - self.theta
+        wrap_to_pi(vec_j.atan2(vec_i) - self.theta)
     }
 
     /// Jacobian of measurement function
@@ -127,3 +161,37 @@ impl MeasurementModel {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ekf_initialization() {
+        let initial_state = Vector2::new(0.247, 0.635);
+        let initial_cov = Matrix2::identity() * 0.01;
+        let ekf = ExtendedKalmanFilter::new(initial_state, initial_cov);
+
+        assert_eq!(ekf.get_state(), initial_state);
+        assert_eq!(ekf.get_covariance(), initial_cov);
+    }
+
+    #[test]
+    fn test_system_model() {
+        let system = SystemModel::new(0.001);
+        let state = Vector2::new(1.0, 2.0);
+        let predicted = system.predict_state(&state);
+
+        // Constant model should return same state
+        assert_eq!(predicted, state);
+    }
+
+    #[test]
+    fn test_measurement_model() {
+        let model = MeasurementModel::new(0.0, 0.0, 0.0, 0.01);
+        let state = Vector2::new(1.0, 1.0);
+        let measurement = model.predict_measurement(&state);
+
+        // atan2(1, 1) = π/4 ≈ 0.785
+        assert!((measurement - std::f64::consts::FRAC_PI_4).abs() < 1e-10);
+    }
+}
