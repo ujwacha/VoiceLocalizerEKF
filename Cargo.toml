@@ -1,0 +1,9 @@
+[package]
+name = "ekf_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.30.9"
+nalgebra = "0.32"
+rerun = "0.28.1"
