@@ -1,9 +1,11 @@
 mod ekf;
-
 use ekf::{ExtendedKalmanFilter, MeasurementModel, SystemModel};
+use ekf_server::RerunHandler;
 use nalgebra::{Matrix2, Vector2};
+use rerun::{RecordingStream, RecordingStreamBuilder};
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -61,14 +63,20 @@ impl MeasurementData {
 }
 
 /// Handle individual client connection
-fn handle_client(stream: TcpStream, shared_state: Arc<Mutex<SharedEkfState>>, client_id: usize) {
+fn handle_client(
+    stream: TcpStream,
+    shared_state: Arc<Mutex<SharedEkfState>>,
+    client_id: usize,
+    mean_sender: mpsc::Sender<(f32, f32)>,
+    cov_sender: mpsc::Sender<Matrix2<f32>>,
+) {
     let peer_addr = stream.peer_addr().unwrap();
     println!("[Client {}] Connected from: {}", client_id, peer_addr);
 
     // Set non-blocking mode for fast reading
     // stream.set_nonblocking(true).unwrap();
 
-    // stream.set_nodelay(true).unwrap();
+    stream.set_nodelay(true).unwrap();
 
     let mut buffer = BufReader::new(&stream);
 
@@ -92,12 +100,11 @@ fn handle_client(stream: TcpStream, shared_state: Arc<Mutex<SharedEkfState>>, cl
         };
 
         if 340.0 * data.del_t > data.d {
-            println!("[Client {}] Invalid measurement: skipping", client_id);
+            //            println!("[Client {}] Invalid measurement: skipping", client_id);
             continue;
         }
 
-        let angle = (340.0 * data.del_t / data.d).asin();
-        let angle = wrap_to_pi(angle);
+        let angle = wrap_to_pi((340.0 * data.del_t / data.d).asin());
 
         // println!(
         //     "[Client {}] {} , {} , {} , {} , {} , {}",
@@ -119,8 +126,6 @@ fn handle_client(stream: TcpStream, shared_state: Arc<Mutex<SharedEkfState>>, cl
                 Some(last_client) => last_client != client_id, // Different client
             };
 
-            println!("[Client {}]", client_id);
-
             if !should_update {
                 // println!(
                 //     "[Client {}] Same client as last update, skipping",
@@ -130,10 +135,10 @@ fn handle_client(stream: TcpStream, shared_state: Arc<Mutex<SharedEkfState>>, cl
             }
 
             // Create measurement model for this observation
-            let measurement_model = MeasurementModel::new(data.h, data.j, data.theta, 0.001);
+            let measurement_model = MeasurementModel::new(data.h, data.j, data.theta, 0.01);
 
             // Always predict before update
-            let system_mode = SystemModel::new(0.1);
+            let system_mode = SystemModel::new(0.01);
             state.ekf.predict(&system_mode);
             // println!("[Client {}] Prediction step executed", client_id);
 
@@ -156,6 +161,16 @@ fn handle_client(stream: TcpStream, shared_state: Arc<Mutex<SharedEkfState>>, cl
                 covariance[(0, 0)],
                 covariance[(1, 1)]
             );
+
+            let covariance: Matrix2<f32> = Matrix2::from_vec(vec![
+                covariance[(0, 0)] as f32,
+                covariance[(0, 1)] as f32,
+                covariance[(1, 0)] as f32,
+                covariance[(1, 1)] as f32,
+            ]);
+
+            let _ = cov_sender.send(covariance);
+            let _ = mean_sender.send((position[0] as f32, position[1] as f32));
         } // Mutex is unlocked here
     }
 }
@@ -180,6 +195,20 @@ fn main() -> std::io::Result<()> {
 
     let mut client_counter = 0;
 
+    let (tx_mean, rx_mean) = std::sync::mpsc::channel::<(f32, f32)>();
+    let (tx_cov, rx_cov) = std::sync::mpsc::channel::<Matrix2<f32>>();
+
+    std::thread::spawn(move || {
+        let rec = RecordingStreamBuilder::new("ekf_visualization")
+            .spawn()
+            .unwrap();
+
+        let rerun_handler =
+            RerunHandler::new(rec, String::from("ExtendedKalmanfilter"), rx_mean, rx_cov);
+
+        rerun_handler.run();
+    });
+
     // Accept connections in a loop
     for stream in listener.incoming() {
         match stream {
@@ -188,9 +217,12 @@ fn main() -> std::io::Result<()> {
                 client_counter += 1;
                 let client_id = client_counter;
 
+                let tx_mean = tx_mean.clone();
+                let tx_cov = tx_cov.clone();
+
                 // Spawn a new thread for each client
                 thread::spawn(move || {
-                    handle_client(stream, shared_state, client_id);
+                    handle_client(stream, shared_state, client_id, tx_mean, tx_cov);
                 });
             }
             Err(e) => {
