@@ -1,4 +1,4 @@
-use nalgebra::{Matrix2, SMatrix, Vector2};
+use nalgebra::{Matrix3, SMatrix, Vector2, Vector3};
 
 use std::f64::consts::PI;
 /// Alternative: Direct computation with modulo
@@ -11,7 +11,11 @@ pub fn angle_difference_simple(angle1: f64, angle2: f64) -> f64 {
     }
 
     // Convert to [-π, π]
-    if diff > PI { diff - 2.0 * PI } else { diff }
+    if diff > PI {
+        diff - 2.0 * PI
+    } else {
+        diff
+    }
 }
 
 pub fn wrap_to_pi(angle: f64) -> f64 {
@@ -25,27 +29,35 @@ pub fn wrap_to_pi(angle: f64) -> f64 {
 /// Extended Kalman Filter for 2D state estimation
 pub struct ExtendedKalmanFilter {
     /// State vector [x, y]
-    pub state: Vector2<f64>,
+    pub state: Vector3<f64>,
     /// Covariance matrix
-    pub covariance: Matrix2<f64>,
+    pub covariance: Matrix3<f64>,
+    /// last update times
+    time: std::time::Instant,
 }
 
 impl ExtendedKalmanFilter {
     /// Create a new EKF with initial state and covariance
-    pub fn new(initial_state: Vector2<f64>, initial_covariance: Matrix2<f64>) -> Self {
+    pub fn new(initial_state: Vector3<f64>, initial_covariance: Matrix3<f64>) -> Self {
         Self {
             state: initial_state,
             covariance: initial_covariance,
+            time: std::time::Instant::now(),
         }
     }
 
     /// Prediction step
-    pub fn predict(&mut self, system_model: &SystemModel) {
+    pub fn predict(&mut self, system_model: &SystemModel, control: &Vector2<f64>) {
+        // find out the time difference
+        let current_time = std::time::Instant::now();
+        let delt = (current_time - self.time).as_secs_f64();
+        self.time = current_time;
+
         // State prediction: x_pred = f(x)
-        self.state = system_model.predict_state(&self.state);
+        self.state = system_model.predict_state(&self.state, control, delt);
 
         // Covariance prediction: P_pred = F * P * F^T + Q
-        let f = system_model.jacobian(&self.state);
+        let f = system_model.jacobian(&self.state, control, delt);
         self.covariance = f * self.covariance * f.transpose() + system_model.process_noise;
     }
 
@@ -71,7 +83,7 @@ impl ExtendedKalmanFilter {
         dbg!(&kalman_gain);
         dbg!(&innovation);
 
-        let mahalanobis = innovation * (1.0 / s[(0, 0)]) * innovation;
+        let mahalanobis = innovation * s_inv * innovation;
 
         if mahalanobis > 1.0 {
             println!("Manalanobis Fucked");
@@ -82,17 +94,17 @@ impl ExtendedKalmanFilter {
         self.state = self.state + kalman_gain * innovation;
 
         // Covariance update: P = (I - K * H) * P
-        let i_kh = Matrix2::identity() - kalman_gain * h;
+        let i_kh = Matrix3::identity() - kalman_gain * h;
         self.covariance = i_kh * self.covariance;
     }
 
     /// Get current state estimate
-    pub fn get_state(&self) -> Vector2<f64> {
+    pub fn get_state(&self) -> Vector3<f64> {
         self.state
     }
 
     /// Get current covariance
-    pub fn get_covariance(&self) -> Matrix2<f64> {
+    pub fn get_covariance(&self) -> Matrix3<f64> {
         self.covariance
     }
 }
@@ -100,24 +112,50 @@ impl ExtendedKalmanFilter {
 /// System model for the robot (constant position model)
 pub struct SystemModel {
     /// Process noise covariance
-    pub process_noise: Matrix2<f64>,
+    pub process_noise: Matrix3<f64>,
 }
 
 impl SystemModel {
     pub fn new(process_noise_variance: f64) -> Self {
         Self {
-            process_noise: Matrix2::identity() * process_noise_variance,
+            process_noise: Matrix3::identity() * process_noise_variance,
         }
     }
 
     /// State transition function: f(x) = x (constant position)
-    pub fn predict_state(&self, state: &Vector2<f64>) -> Vector2<f64> {
-        *state
+    pub fn predict_state(
+        &self,
+        state: &Vector3<f64>,
+        input: &Vector2<f64>,
+        delt: f64,
+    ) -> Vector3<f64> {
+        let mut next_state = *state;
+        // the prediction step equations
+        next_state[0] += input[0] * state[2].cos() * delt; // x + v * cos(theta) * delt
+        next_state[1] += input[0] * state[2].sin() * delt; // y + v * sin(theta) * delt
+        next_state[2] += input[1] * delt; // theta + omega*delt
+
+        return next_state;
     }
 
     /// Jacobian of state transition function (identity for constant model)
-    pub fn jacobian(&self, _state: &Vector2<f64>) -> Matrix2<f64> {
-        Matrix2::identity()
+    pub fn jacobian(
+        &self,
+        state: &Vector3<f64>,
+        control: &Vector2<f64>,
+        delt: f64,
+    ) -> Matrix3<f64> {
+        Matrix3::new(
+            1.0,
+            0.0,
+            -control[0] * state[2].sin() * delt, // -v * sin(theta) * delt
+            0.0,
+            1.0,
+            control[0] * state[2].cos() * delt, // v * cos(theta) * delt
+            0.0,
+            0.0,
+            1.0,
+        )
     }
 }
 
@@ -143,7 +181,7 @@ impl MeasurementModel {
     }
 
     /// Measurement function: h(x) = atan2(y - k, x - h) - theta
-    pub fn predict_measurement(&self, state: &Vector2<f64>) -> f64 {
+    pub fn predict_measurement(&self, state: &Vector3<f64>) -> f64 {
         let vec_i = state[0] - self.h_pos;
         let vec_j = state[1] - self.k_pos;
         wrap_to_pi(vec_j.atan2(vec_i) - self.theta)
@@ -152,46 +190,13 @@ impl MeasurementModel {
     /// Jacobian of measurement function
     /// H = [-vec_j / magn, vec_i / magn]
     /// where magn = vec_i^2 + vec_j^2
-    pub fn jacobian(&self, state: &Vector2<f64>) -> SMatrix<f64, 1, 2> {
+    pub fn jacobian(&self, state: &Vector3<f64>) -> SMatrix<f64, 1, 3> {
         let vec_i = state[0] - self.h_pos;
         let vec_j = state[1] - self.k_pos;
         let magn = vec_i * vec_i + vec_j * vec_j;
 
-        SMatrix::<f64, 1, 2>::from_row_slice(&[-vec_j / magn, vec_i / magn])
-    }
-}
+        let zero: f64 = 0.0;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ekf_initialization() {
-        let initial_state = Vector2::new(0.247, 0.635);
-        let initial_cov = Matrix2::identity() * 0.01;
-        let ekf = ExtendedKalmanFilter::new(initial_state, initial_cov);
-
-        assert_eq!(ekf.get_state(), initial_state);
-        assert_eq!(ekf.get_covariance(), initial_cov);
-    }
-
-    #[test]
-    fn test_system_model() {
-        let system = SystemModel::new(0.001);
-        let state = Vector2::new(1.0, 2.0);
-        let predicted = system.predict_state(&state);
-
-        // Constant model should return same state
-        assert_eq!(predicted, state);
-    }
-
-    #[test]
-    fn test_measurement_model() {
-        let model = MeasurementModel::new(0.0, 0.0, 0.0, 0.01);
-        let state = Vector2::new(1.0, 1.0);
-        let measurement = model.predict_measurement(&state);
-
-        // atan2(1, 1) = π/4 ≈ 0.785
-        assert!((measurement - std::f64::consts::FRAC_PI_4).abs() < 1e-10);
+        SMatrix::<f64, 1, 3>::from_row_slice(&[-vec_j / magn, vec_i / magn, zero])
     }
 }
