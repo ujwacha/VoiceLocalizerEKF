@@ -1,7 +1,7 @@
 mod ekf;
 use ekf::{ExtendedKalmanFilter, MeasurementModel, SystemModel};
 use ekf_server::RerunHandler;
-use nalgebra::{Matrix2, Vector2};
+use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
 use rerun::{RecordingStream, RecordingStreamBuilder};
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpListener, TcpStream};
@@ -21,8 +21,8 @@ struct SharedEkfState {
 impl SharedEkfState {
     fn new() -> Self {
         // Initialize state at (0.247, 0.635)
-        let initial_state = Vector2::new(0.247, 0.635);
-        let initial_covariance = Matrix2::identity() * 0.01;
+        let initial_state = Vector3::new(0.0, 0.0, 0.0);
+        let initial_covariance = Matrix3::identity() * 0.01;
         let ekf = ExtendedKalmanFilter::new(initial_state, initial_covariance);
 
         Self {
@@ -66,6 +66,7 @@ impl MeasurementData {
 fn handle_client(
     stream: TcpStream,
     shared_state: Arc<Mutex<SharedEkfState>>,
+    shared_control: Arc<Mutex<Vector2<f64>>>,
     client_id: usize,
     mean_sender: mpsc::Sender<(f32, f32)>,
     cov_sender: mpsc::Sender<Matrix2<f32>>,
@@ -139,7 +140,12 @@ fn handle_client(
 
             // Always predict before update
             let system_mode = SystemModel::new(0.01);
-            state.ekf.predict(&system_mode);
+
+            {
+                state
+                    .ekf
+                    .predict(&system_mode, &*shared_control.lock().unwrap());
+            }
             // println!("[Client {}] Prediction step executed", client_id);
 
             // Update step with the angle measurement
@@ -181,11 +187,19 @@ fn main() -> std::io::Result<()> {
     // Create shared EKF state
     let shared_state = Arc::new(Mutex::new(SharedEkfState::new()));
 
+    // no control initially
+    let shared_control = Arc::new(Mutex::new(Vector2::<f64>::new(0.0, 0.0)));
+
     // Perform initial prediction
     {
         let mut state = shared_state.lock().unwrap();
         let system_model = SystemModel::new(0.01);
-        state.ekf.predict(&system_model);
+        {
+            state
+                .ekf
+                .predict(&system_model, &*shared_control.lock().unwrap());
+        }
+
         println!("EKF initialized at: {:?}", state.ekf.get_state());
     }
 
@@ -214,6 +228,7 @@ fn main() -> std::io::Result<()> {
         match stream {
             Ok(stream) => {
                 let shared_state = Arc::clone(&shared_state);
+                let shared_control = Arc::clone(&shared_control);
                 client_counter += 1;
                 let client_id = client_counter;
 
@@ -222,7 +237,14 @@ fn main() -> std::io::Result<()> {
 
                 // Spawn a new thread for each client
                 thread::spawn(move || {
-                    handle_client(stream, shared_state, client_id, tx_mean, tx_cov);
+                    handle_client(
+                        stream,
+                        shared_state,
+                        shared_control,
+                        client_id,
+                        tx_mean,
+                        tx_cov,
+                    );
                 });
             }
             Err(e) => {
