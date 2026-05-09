@@ -1,9 +1,10 @@
 mod ekf;
+use core::f64;
 use ekf::{ExtendedKalmanFilter, MeasurementModel, SystemModel};
 use ekf_server::RerunHandler;
 use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
 use rerun::{RecordingStream, RecordingStreamBuilder};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -181,6 +182,56 @@ fn handle_client(
     }
 }
 
+fn handle_controller_connection(
+    mut stream: TcpStream,
+    kf_state: Arc<Mutex<SharedEkfState>>,
+    control: Arc<Mutex<Vector2<f64>>>,
+) -> Result<(), ()> {
+    stream.set_nodelay(true).unwrap();
+
+    let mut buffer = BufReader::new(&stream);
+
+    println!("STREAM STARTED");
+
+    // Step 1: Parse the results and write it into
+
+    let mut buf = String::new();
+
+    if let Err(e) = buffer.read_line(&mut buf) {
+        println!("ERROR: {:?}", e);
+        return Err(());
+    }
+
+    let buf = buf.trim().to_string();
+
+    let numbers: Vec<String> = buf.trim().split(',').map(|x| String::from(x)).collect();
+
+    {
+        let mut locked_control = match control.lock() {
+            Ok(x) => *x,
+            Err(_) => return Err(()),
+        };
+
+        locked_control[0] = numbers[0].parse().unwrap_or(0.0);
+        locked_control[1] = numbers[1].parse().unwrap_or(0.0);
+    }
+
+    // Now the mutex is dropped, it is safe to lock the kalman filter state and
+    // the current state to the controller
+    {
+        let locked_kalman = match kf_state.lock() {
+            Ok(x) => x,
+            Err(_) => return Err(()),
+        };
+
+        let state = locked_kalman.ekf.state;
+        let response = format!("{},{},{}\n", state[0], state[1], state[2]);
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    Ok(())
+}
+
 fn main() -> std::io::Result<()> {
     let addr = "192.168.247.191:9099";
 
@@ -221,6 +272,29 @@ fn main() -> std::io::Result<()> {
             RerunHandler::new(rec, String::from("ExtendedKalmanfilter"), rx_mean, rx_cov);
 
         rerun_handler.run();
+    });
+
+    // spawn a thread for listening for control signals
+
+    // spawn a new thread for handling a single client
+
+    let cloned_ss = Arc::clone(&shared_state);
+    let cloned_ctrl = Arc::clone(&shared_control);
+
+    thread::spawn(move || {
+        let addr_input = "192.168.247.191:9100";
+
+        let control_listener = TcpListener::bind(&addr_input).unwrap();
+        println!("Server listening on: {}", &addr_input);
+
+        for stream in control_listener.incoming() {
+            let stream = match stream {
+                Ok(val) => val,
+                Err(_) => continue,
+            };
+
+            let _ = handle_controller_connection(stream, cloned_ss.clone(), cloned_ctrl.clone());
+        }
     });
 
     // Accept connections in a loop
