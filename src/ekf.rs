@@ -67,6 +67,10 @@ impl ExtendedKalmanFilter {
         let predicted_measurement = wrap_to_pi(measurement_model.predict_measurement(&self.state));
         let innovation = angle_difference_simple(measurement, predicted_measurement);
 
+        if innovation.is_nan() {
+            return;
+        }
+
         // Measurement Jacobian
         let h = measurement_model.jacobian(&self.state);
 

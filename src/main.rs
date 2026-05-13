@@ -3,6 +3,7 @@ use core::f64;
 use ekf::{ExtendedKalmanFilter, MeasurementModel, SystemModel};
 use ekf_server::RerunHandler;
 use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
+//use rerun::external::arrow::csv::reader;
 use rerun::{RecordingStream, RecordingStreamBuilder};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -66,8 +67,7 @@ impl MeasurementData {
 /// Handle individual client connection
 fn handle_client(
     stream: TcpStream,
-    shared_state: Arc<Mutex<SharedEkfState>>,
-    shared_control: Arc<Mutex<Vector2<f64>>>,
+    shared_info: Arc<Mutex<(SharedEkfState, Vector2<f64>)>>,
     client_id: usize,
     mean_sender: mpsc::Sender<(f32, f32)>,
     cov_sender: mpsc::Sender<Matrix2<f32>>,
@@ -75,255 +75,177 @@ fn handle_client(
     let peer_addr = stream.peer_addr().unwrap();
     println!("[Client {}] Connected from: {}", client_id, peer_addr);
 
-    // Set non-blocking mode for fast reading
-    // stream.set_nonblocking(true).unwrap();
-
-    stream.set_nodelay(true).unwrap();
-
-    let mut buffer = BufReader::new(&stream);
-
+    let mut reader = BufReader::new(stream);
     println!("STREAM STARTED");
 
     loop {
-        // Try to read from stream - non-blocking
-
         let mut buf = String::new();
-
-        if let Err(e) = buffer.read_line(&mut buf) {
+        if let Err(e) = reader.read_line(&mut buf) {
             println!("ERROR: {:?}", e);
             continue;
         }
 
         let buf = buf.trim().to_string();
-
         let data = match MeasurementData::parse(buf.as_str()) {
             Some(val) => val,
             None => continue,
         };
 
         if 340.0 * data.del_t > data.d {
-            //            println!("[Client {}] Invalid measurement: skipping", client_id);
             continue;
         }
 
         let angle = wrap_to_pi((340.0 * data.del_t / data.d).asin());
 
-        // println!(
-        //     "[Client {}] {} , {} , {} , {} , {} , {}",
-        //     client_id,
-        //     data.timestamp,
-        //     data.h,
-        //     data.j,
-        //     data.theta,
-        //     data.d,
-        //     angle.to_degrees()
-        // );
+        // Lock the mutex and get a mutable reference to the inner tuple
+        let mut guard = shared_info.lock().unwrap();
+        let (ref mut state, ref mut control) = *guard; // borrow, not move
 
-        {
-            let mut state = shared_state.lock().unwrap();
+        // Check if this is a different client than the last update
+        let should_update = match state.last_update_client {
+            None => true,
+            Some(last_client) => last_client != client_id,
+        };
 
-            // Check if this is a different client than the last update
-            let should_update = match state.last_update_client {
-                None => true,                                  // First update ever
-                Some(last_client) => last_client != client_id, // Different client
-            };
+        if !should_update {
+            continue;
+        }
 
-            if !should_update {
-                // println!(
-                //     "[Client {}] Same client as last update, skipping",
-                //     client_id
-                // );
-                continue;
-            }
+        let measurement_model = MeasurementModel::new(data.h, data.j, data.theta, 0.01);
+        let system_model = SystemModel::new(0.01);
 
-            // Create measurement model for this observation
-            let measurement_model = MeasurementModel::new(data.h, data.j, data.theta, 0.01);
+        state.ekf.predict(&system_model, control);
+        state.ekf.update(&measurement_model, angle);
+        state.last_update_client = Some(client_id);
+        state.update_count += 1;
 
-            // Always predict before update
-            let system_mode = SystemModel::new(0.01);
+        let position = state.ekf.get_state();
+        let covariance = state.ekf.get_covariance();
 
-            {
-                state
-                    .ekf
-                    .predict(&system_mode, &*shared_control.lock().unwrap());
-            }
-            // println!("[Client {}] Prediction step executed", client_id);
+        println!(
+            "[Client {}] Position: {} , {}",
+            client_id, position[0], position[1]
+        );
+        println!(
+            "[Client {}] Covariance: {} , {}",
+            client_id,
+            covariance[(0, 0)],
+            covariance[(1, 1)]
+        );
 
-            // Update step with the angle measurement
-            state.ekf.update(&measurement_model, angle);
-            state.last_update_client = Some(client_id);
-            state.update_count += 1;
+        let covariance_2d: Matrix2<f32> = Matrix2::new(
+            covariance[(0, 0)] as f32,
+            covariance[(0, 1)] as f32,
+            covariance[(1, 0)] as f32,
+            covariance[(1, 1)] as f32,
+        );
 
-            // Get updated state and covariance
-            let position = state.ekf.get_state();
-            let covariance = state.ekf.get_covariance();
-
-            println!(
-                "[Client {}] Position: {} , {}",
-                client_id, position[0], position[1]
-            );
-            println!(
-                "[Client {}] Covariance: {} , {}",
-                client_id,
-                covariance[(0, 0)],
-                covariance[(1, 1)]
-            );
-
-            let covariance: Matrix2<f32> = Matrix2::from_vec(vec![
-                covariance[(0, 0)] as f32,
-                covariance[(0, 1)] as f32,
-                covariance[(1, 0)] as f32,
-                covariance[(1, 1)] as f32,
-            ]);
-
-            let _ = cov_sender.send(covariance);
-            let _ = mean_sender.send((position[0] as f32, position[1] as f32));
-        } // Mutex is unlocked here
+        let _ = cov_sender.send(covariance_2d);
+        let _ = mean_sender.send((position[0] as f32, position[1] as f32));
     }
 }
 
 fn handle_controller_connection(
-    mut stream: TcpStream,
-    kf_state: Arc<Mutex<SharedEkfState>>,
-    control: Arc<Mutex<Vector2<f64>>>,
+    stream: TcpStream,
+    shared_info: Arc<Mutex<(SharedEkfState, Vector2<f64>)>>,
 ) -> Result<(), ()> {
     stream.set_nodelay(true).unwrap();
+    println!("Controller connection started");
 
-    let mut buffer = BufReader::new(&stream);
+    // Wrap the stream in a BufReader that owns it.
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut buf = String::new();
+        if let Err(e) = reader.read_line(&mut buf) {
+            println!("ERROR: {:?}", e);
+            continue;
+        }
 
-    println!("STREAM STARTED");
+        let buf = buf.trim().to_string();
+        let numbers: Vec<String> = buf.split(',').map(String::from).collect();
+        if numbers.len() < 2 {
+            continue;
+        }
 
-    // Step 1: Parse the results and write it into
+        let v = numbers[0].parse().unwrap_or(0.0);
+        let omega = numbers[1].parse().unwrap_or(0.0);
 
-    let mut buf = String::new();
+        // Lock mutex and update control
+        let mut guard = shared_info.lock().unwrap();
+        let (ref mut state, ref mut control) = *guard;
+        *control = Vector2::new(v, omega);
 
-    if let Err(e) = buffer.read_line(&mut buf) {
-        println!("ERROR: {:?}", e);
-        return Err(());
+        dbg!(control);
+
+        let pos = state.ekf.get_state();
+        let response = format!("{},{},{}\n", pos[0], pos[1], pos[2]);
+
+        // Write using the underlying stream (BufReader gives mutable access)
+        if let Err(e) = reader.get_mut().write_all(response.as_bytes()) {
+            println!("Write error: {:?}", e);
+        }
     }
-
-    let buf = buf.trim().to_string();
-
-    let numbers: Vec<String> = buf.trim().split(',').map(|x| String::from(x)).collect();
-
-    {
-        let mut locked_control = match control.lock() {
-            Ok(x) => *x,
-            Err(_) => return Err(()),
-        };
-
-        locked_control[0] = numbers[0].parse().unwrap_or(0.0);
-        locked_control[1] = numbers[1].parse().unwrap_or(0.0);
-    }
-
-    // Now the mutex is dropped, it is safe to lock the kalman filter state and
-    // the current state to the controller
-    {
-        let locked_kalman = match kf_state.lock() {
-            Ok(x) => x,
-            Err(_) => return Err(()),
-        };
-
-        let state = locked_kalman.ekf.state;
-        let response = format!("{},{},{}\n", state[0], state[1], state[2]);
-        let _ = stream.write_all(response.as_bytes());
-    }
-
-    Ok(())
 }
 
 fn main() -> std::io::Result<()> {
-    let addr = "192.168.247.191:9099";
+    let addr = "10.220.135.191:6060";
+    let full_info_mutex = Arc::new(Mutex::new((
+        SharedEkfState::new(),
+        Vector2::<f64>::new(0.0, 0.0),
+    )));
 
-    // Create shared EKF state
-    let shared_state = Arc::new(Mutex::new(SharedEkfState::new()));
-
-    // no control initially
-    let shared_control = Arc::new(Mutex::new(Vector2::<f64>::new(0.0, 0.0)));
-
-    // Perform initial prediction
+    // Initial prediction
     {
-        let mut state = shared_state.lock().unwrap();
+        let mut guard = full_info_mutex.lock().unwrap();
+        let (ref mut state, ref mut control) = *guard;
         let system_model = SystemModel::new(0.01);
-        {
-            state
-                .ekf
-                .predict(&system_model, &*shared_control.lock().unwrap());
-        }
-
+        state.ekf.predict(&system_model, control);
         println!("EKF initialized at: {:?}", state.ekf.get_state());
     }
 
-    // Bind TCP listener
     let listener = TcpListener::bind(addr)?;
     println!("Server listening on: {}", addr);
 
-    let mut client_counter = 0;
+    let (tx_mean, rx_mean) = mpsc::channel();
+    let (tx_cov, rx_cov) = mpsc::channel();
 
-    let (tx_mean, rx_mean) = std::sync::mpsc::channel::<(f32, f32)>();
-    let (tx_cov, rx_cov) = std::sync::mpsc::channel::<Matrix2<f32>>();
-
-    std::thread::spawn(move || {
+    // Visualization thread
+    thread::spawn(move || {
         let rec = RecordingStreamBuilder::new("ekf_visualization")
             .spawn()
             .unwrap();
-
         let rerun_handler =
-            RerunHandler::new(rec, String::from("ExtendedKalmanfilter"), rx_mean, rx_cov);
-
+            RerunHandler::new(rec, "ExtendedKalmanfilter".to_string(), rx_mean, rx_cov);
         rerun_handler.run();
     });
 
-    // spawn a thread for listening for control signals
-
-    // spawn a new thread for handling a single client
-
-    let cloned_ss = Arc::clone(&shared_state);
-    let cloned_ctrl = Arc::clone(&shared_control);
-
+    // Controller listener thread
+    let cloned_info = Arc::clone(&full_info_mutex);
     thread::spawn(move || {
-        let addr_input = "192.168.247.191:9100";
-
-        let control_listener = TcpListener::bind(&addr_input).unwrap();
-        println!("Server listening on: {}", &addr_input);
-
+        let addr_input = "10.220.135.191:9100";
+        let control_listener = TcpListener::bind(addr_input).unwrap();
+        println!("Controller listening on: {}", addr_input);
         for stream in control_listener.incoming() {
-            let stream = match stream {
-                Ok(val) => val,
-                Err(_) => continue,
-            };
-
-            let _ = handle_controller_connection(stream, cloned_ss.clone(), cloned_ctrl.clone());
+            if let Ok(stream) = stream {
+                let _ = handle_controller_connection(stream, cloned_info.clone());
+            }
         }
     });
 
-    // Accept connections in a loop
+    // Client connections
+    let mut client_counter = 0;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let shared_state = Arc::clone(&shared_state);
-                let shared_control = Arc::clone(&shared_control);
                 client_counter += 1;
-                let client_id = client_counter;
-
+                let full_info_clone = Arc::clone(&full_info_mutex);
                 let tx_mean = tx_mean.clone();
                 let tx_cov = tx_cov.clone();
-
-                // Spawn a new thread for each client
                 thread::spawn(move || {
-                    handle_client(
-                        stream,
-                        shared_state,
-                        shared_control,
-                        client_id,
-                        tx_mean,
-                        tx_cov,
-                    );
+                    handle_client(stream, full_info_clone, client_counter, tx_mean, tx_cov);
                 });
             }
-            Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
-            }
+            Err(e) => eprintln!("Error accepting connection: {}", e),
         }
     }
 

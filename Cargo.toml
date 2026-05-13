@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 glam = "0.30.9"
 nalgebra = "0.32"
-rerun = "0.28.1"
+rerun = "0.31.4"
